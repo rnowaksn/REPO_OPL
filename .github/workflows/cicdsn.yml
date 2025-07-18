@@ -1,0 +1,327 @@
+name: cicdsn
+
+# Trigger the workflow on push to main/develop or pull requests
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch: # Allow manual trigger
+
+# Environment variables
+env:
+  NODE_VERSION: '18'
+  SERVICENOW_INSTANCE: 'your-instance.service-now.com'
+  APPLICATION_NAME: 'MyApp'
+
+jobs:
+  # Job 1: Code Quality and Testing
+  test:
+    name: Run Tests and Code Quality Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Run linting
+      run: npm run lint
+      
+    - name: Run unit tests
+      run: npm test -- --coverage
+      
+    - name: Run security scan
+      run: npm audit --audit-level moderate
+      
+    - name: Upload test results
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: test-results
+        path: coverage/
+
+  # Job 2: Build Application
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Build application
+      run: npm run build
+      
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-files
+        path: dist/
+
+  # Job 3: ServiceNow Change Request Creation (for main branch only)
+  servicenow-change-request:
+    name: Create ServiceNow Change Request
+    runs-on: ubuntu-latest
+    needs: [test, build]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      change_request_number: ${{ steps.create-cr.outputs.change_request }}
+    
+    steps:
+    - name: Create Change Request in ServiceNow
+      id: create-cr
+      run: |
+        # Create change request via ServiceNow REST API
+        RESPONSE=$(curl -s -X POST \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d '{
+            "short_description": "Automated deployment for ${{ env.APPLICATION_NAME }} - Build ${{ github.run_number }}",
+            "description": "Automated deployment triggered by commit ${{ github.sha }}. GitHub Actions workflow: ${{ github.workflow }}",
+            "category": "Software",
+            "subcategory": "Application",
+            "priority": "3",
+            "risk": "2",
+            "impact": "3",
+            "type": "Normal",
+            "requested_by": "${{ secrets.SERVICENOW_USERNAME }}",
+            "assignment_group": "${{ secrets.SERVICENOW_ASSIGNMENT_GROUP }}",
+            "cmdb_ci": "${{ env.APPLICATION_NAME }}",
+            "justification": "Automated deployment following successful CI/CD pipeline",
+            "implementation_plan": "Deploy application using GitHub Actions pipeline",
+            "backout_plan": "Rollback to previous version using deployment rollback procedure",
+            "test_plan": "Automated tests have passed in CI pipeline"
+          }')
+        
+        # Extract change request number
+        CHANGE_NUMBER=$(echo $RESPONSE | jq -r '.result.number')
+        echo "change_request=$CHANGE_NUMBER" >> $GITHUB_OUTPUT
+        echo "Created Change Request: $CHANGE_NUMBER"
+        
+        # Store change request sys_id for later updates
+        CHANGE_SYS_ID=$(echo $RESPONSE | jq -r '.result.sys_id')
+        echo "CHANGE_SYS_ID=$CHANGE_SYS_ID" >> $GITHUB_ENV
+
+    - name: Update Change Request with Build Info
+      run: |
+        curl -X PATCH \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request/${{ env.CHANGE_SYS_ID }}" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d '{
+            "work_notes": "Build completed successfully. Build number: ${{ github.run_number }}. Commit SHA: ${{ github.sha }}. Workflow URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          }'
+
+  # Job 4: Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [servicenow-change-request]
+    if: github.ref == 'refs/heads/main'
+    environment: staging
+    
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-files
+        path: dist/
+        
+    - name: Deploy to staging environment
+      run: |
+        echo "Deploying to staging..."
+        # Add your deployment commands here
+        # e.g., rsync, docker deploy, kubectl apply, etc.
+        
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests..."
+        # Add smoke test commands here
+        
+    - name: Update ServiceNow - Staging Deployment
+      run: |
+        # Get change request sys_id from previous job
+        CHANGE_SYS_ID=$(curl -s -X GET \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request?sysparm_query=number=${{ needs.servicenow-change-request.outputs.change_request_number }}" \
+          -H "Accept: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          | jq -r '.result[0].sys_id')
+        
+        # Update change request
+        curl -X PATCH \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request/$CHANGE_SYS_ID" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d '{
+            "work_notes": "Successfully deployed to staging environment. Smoke tests passed. Ready for production deployment approval.",
+            "state": "3"
+          }'
+
+  # Job 5: Deploy to Production (requires manual approval)
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, servicenow-change-request]
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Download build artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: build-files
+        path: dist/
+        
+    - name: Deploy to production environment
+      run: |
+        echo "Deploying to production..."
+        # Add your production deployment commands here
+        
+    - name: Update ServiceNow - Production Deployment Success
+      run: |
+        # Get change request sys_id
+        CHANGE_SYS_ID=$(curl -s -X GET \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request?sysparm_query=number=${{ needs.servicenow-change-request.outputs.change_request_number }}" \
+          -H "Accept: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          | jq -r '.result[0].sys_id')
+        
+        # Mark change request as implemented
+        curl -X PATCH \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request/$CHANGE_SYS_ID" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d '{
+            "work_notes": "Production deployment completed successfully. Application is live.",
+            "state": "3",
+            "close_code": "successful",
+            "close_notes": "Deployment completed without issues. All systems operational."
+          }'
+
+  # Job 6: Post-Deployment Monitoring and ServiceNow Update
+  post-deployment:
+    name: Post-Deployment Tasks
+    runs-on: ubuntu-latest
+    needs: [deploy-production, servicenow-change-request]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Run health checks
+      run: |
+        echo "Running post-deployment health checks..."
+        # Add health check commands here
+        # e.g., curl health endpoints, check metrics, etc.
+        
+    - name: Create ServiceNow Incident (if deployment failed)
+      if: failure()
+      run: |
+        curl -X POST \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/incident" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d '{
+            "short_description": "Deployment failure for ${{ env.APPLICATION_NAME }} - Build ${{ github.run_number }}",
+            "description": "Automated deployment failed. Workflow: ${{ github.workflow }}, Run ID: ${{ github.run_id }}, Commit: ${{ github.sha }}",
+            "category": "Software",
+            "subcategory": "Application Error",
+            "priority": "2",
+            "urgency": "2",
+            "impact": "2",
+            "caller_id": "${{ secrets.SERVICENOW_USERNAME }}",
+            "assignment_group": "${{ secrets.SERVICENOW_ASSIGNMENT_GROUP }}",
+            "cmdb_ci": "${{ env.APPLICATION_NAME }}"
+          }'
+
+    - name: Close Change Request
+      if: success()
+      run: |
+        # Get change request sys_id
+        CHANGE_SYS_ID=$(curl -s -X GET \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request?sysparm_query=number=${{ needs.servicenow-change-request.outputs.change_request_number }}" \
+          -H "Accept: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          | jq -r '.result[0].sys_id')
+        
+        # Close the change request
+        curl -X PATCH \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request/$CHANGE_SYS_ID" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d '{
+            "work_notes": "Post-deployment health checks completed successfully. Change request closed.",
+            "state": "6"
+          }'
+
+  # Job 7: Notification
+  notify:
+    name: Send Notifications
+    runs-on: ubuntu-latest
+    needs: [post-deployment, servicenow-change-request]
+    if: always() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Notify Teams/Slack
+      run: |
+        if [ "${{ job.status }}" == "success" ]; then
+          MESSAGE="✅ Deployment successful for ${{ env.APPLICATION_NAME }} (Build ${{ github.run_number }})"
+        else
+          MESSAGE="❌ Deployment failed for ${{ env.APPLICATION_NAME }} (Build ${{ github.run_number }})"
+        fi
+        
+        echo "Would send notification: $MESSAGE"
+        # Add your notification logic here (Slack, Teams, email, etc.)
+        
+    - name: Update ServiceNow with Final Status
+      run: |
+        STATUS="${{ needs.post-deployment.result }}"
+        if [ "$STATUS" == "success" ]; then
+          FINAL_STATE="6"  # Closed
+          NOTES="Deployment pipeline completed successfully. All stages passed."
+        else
+          FINAL_STATE="4"  # Cancelled
+          NOTES="Deployment pipeline failed. Please check workflow logs and incident tickets."
+        fi
+        
+        # Get change request sys_id
+        CHANGE_SYS_ID=$(curl -s -X GET \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request?sysparm_query=number=${{ needs.servicenow-change-request.outputs.change_request_number }}" \
+          -H "Accept: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          | jq -r '.result[0].sys_id')
+        
+        # Final update
+        curl -X PATCH \
+          "https://${{ env.SERVICENOW_INSTANCE }}/api/now/table/change_request/$CHANGE_SYS_ID" \
+          -H "Accept: application/json" \
+          -H "Content-Type: application/json" \
+          -u "${{ secrets.SERVICENOW_USERNAME }}:${{ secrets.SERVICENOW_PASSWORD }}" \
+          -d "{
+            \"work_notes\": \"$NOTES\",
+            \"state\": \"$FINAL_STATE\"
+          }"
