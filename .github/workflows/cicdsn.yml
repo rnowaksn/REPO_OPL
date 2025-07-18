@@ -11,8 +11,8 @@ on:
 # Environment variables
 env:
   NODE_VERSION: '18'
-  SERVICENOW_INSTANCE: 'your-instance.service-now.com'
-  APPLICATION_NAME: 'MyApp'
+  SERVICENOW_INSTANCE: 'oplservicenow.service-now.com'
+  APPLICATION_NAME: 'OPLDEVOPS'
 
 jobs:
   # Job 1: Code Quality and Testing
